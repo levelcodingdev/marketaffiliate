@@ -9,11 +9,11 @@ export default function ProductDetailPage() {
   const { id } = useParams();
   const [searchParams] = useSearchParams();
   const referralCode = searchParams.get('ref');
+  const checkoutStatus = searchParams.get('checkout');
   const [product, setProduct] = useState(null);
   const [loading, setLoading] = useState(true);
   const [buying, setBuying] = useState(false);
   const [error, setError] = useState('');
-  const [success, setSuccess] = useState('');
 
   useEffect(() => {
     captureReferral(id, referralCode);
@@ -46,32 +46,32 @@ export default function ProductDetailPage() {
   const buy = async () => {
     setBuying(true);
     setError('');
-    setSuccess('');
 
     try {
-      const data = await api('/purchase', {
+      const data = await api('/checkout-session', {
         method: 'POST',
         body: {
           product_id: Number(id),
           referral_code: referralCode || getReferralCode(),
         },
       });
-      const reference = data.conversion?.payment_reference;
-      setSuccess(reference ? `Test purchase recorded. Reference: ${reference}` : 'Test purchase recorded.');
+      window.location.assign(data.checkout_url);
     } catch (err) {
       setError(err.message);
-    } finally {
       setBuying(false);
     }
   };
 
-  const activeReferral = referralCode || getReferralCode();
+  const checkoutMessage = checkoutStatus === 'success'
+    ? 'Payment complete. Your conversion will appear after the Stripe webhook is received.'
+    : '';
 
   return (
     <section className="grid gap-5">
       {loading ? <div className={feedback.loading}>Loading product...</div> : null}
       {error ? <div className={feedback.alert}>{error}</div> : null}
-      {success ? <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3.5 py-3 font-bold text-emerald-800">{success}</div> : null}
+      {checkoutStatus === 'cancelled' ? <div className="rounded-lg border border-amber-200 bg-amber-50 px-3.5 py-3 font-bold text-amber-800">Checkout cancelled. No payment was recorded.</div> : null}
+      {checkoutMessage ? <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3.5 py-3 font-bold text-emerald-800">{checkoutMessage}</div> : null}
 
       {product ? (
         <>
@@ -87,15 +87,10 @@ export default function ProductDetailPage() {
               <strong className="text-3xl font-extrabold text-slate-950">{money(product.price_cents)}</strong>
               <p className="mb-0 text-slate-600">{percent(product.commission_percent)} affiliate commission</p>
               <button className={buttonClass('primary', 'w-full')} type="button" onClick={buy} disabled={buying}>
-                {buying ? 'Recording purchase...' : 'Buy now (test)'}
+                {buying ? 'Opening Stripe checkout...' : 'Buy with Stripe'}
               </button>
-              <p className="m-0 text-xs font-bold text-slate-500">Instant test payment. No card required.</p>
+              <p className="m-0 text-xs font-bold text-slate-500">Secure checkout handled by Stripe.</p>
             </aside>
-          </div>
-
-          <div className="flex flex-col items-start justify-between gap-3.5 rounded-lg border border-blue-200 bg-blue-50 px-4 py-3.5 text-blue-900 sm:flex-row sm:items-center">
-            <span className="font-extrabold">Referral attribution</span>
-            <strong className="break-words">{activeReferral || 'No active referral'}</strong>
           </div>
         </>
       ) : null}

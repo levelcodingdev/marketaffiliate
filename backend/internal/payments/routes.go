@@ -1,50 +1,51 @@
 package payments
 
 import (
-	"crypto/rand"
 	"database/sql"
-	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
-	"time"
 
 	"affiliatetrack/backend/internal/config"
 	"affiliatetrack/backend/internal/products"
 
 	"github.com/gin-gonic/gin"
+	"github.com/stripe/stripe-go/v85"
+	checkoutsession "github.com/stripe/stripe-go/v85/checkout/session"
+	"github.com/stripe/stripe-go/v85/webhook"
 )
 
 type Handler struct {
-	db *sql.DB
+	cfg config.Config
+	db  *sql.DB
 }
 
-type purchaseRequest struct {
+type checkoutRequest struct {
 	ProductID    int64  `json:"product_id"`
 	ReferralCode string `json:"referral_code"`
+	SuccessURL   string `json:"success_url"`
+	CancelURL    string `json:"cancel_url"`
 }
 
-type conversionResponse struct {
-	ID                    int64     `json:"id"`
-	AffiliateID           *int64    `json:"affiliate_id"`
-	SellerID              int64     `json:"seller_id"`
-	ProductID             int64     `json:"product_id"`
-	AmountCents           int64     `json:"amount_cents"`
-	CommissionAmountCents int64     `json:"commission_amount_cents"`
-	PaymentReference      string    `json:"payment_reference"`
-	CreatedAt             time.Time `json:"created_at"`
+func RegisterRoutes(checkout *gin.RouterGroup, webhookGroup *gin.RouterGroup, cfg config.Config, database *sql.DB) {
+	handler := Handler{cfg: cfg, db: database}
+
+	checkout.POST("", handler.createCheckoutSession)
+	webhookGroup.POST("/stripe", handler.stripeWebhook)
 }
 
-func RegisterRoutes(purchase *gin.RouterGroup, _ config.Config, database *sql.DB) {
-	handler := Handler{db: database}
+func (h Handler) createCheckoutSession(c *gin.Context) {
+	if h.cfg.StripeSecretKey == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "STRIPE_SECRET_KEY is not configured"})
+		return
+	}
 
-	purchase.POST("", handler.completeTestPurchase)
-}
-
-func (h Handler) completeTestPurchase(c *gin.Context) {
-	var req purchaseRequest
+	var req checkoutRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON body"})
 		return
@@ -69,28 +70,124 @@ func (h Handler) completeTestPurchase(c *gin.Context) {
 		return
 	}
 
-	conversion, err := h.recordTestConversion(product, req.ReferralCode)
+	session, err := h.createStripeSession(product, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not record test purchase"})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "stripe checkout failed", "details": err.Error()})
 		return
 	}
 
 	c.JSON(http.StatusCreated, gin.H{
-		"message":    "test purchase recorded",
-		"conversion": conversion,
+		"checkout_session_id": session.ID,
+		"checkout_url":        session.URL,
 	})
 }
 
-func (h Handler) recordTestConversion(product products.Product, referralCode string) (conversionResponse, error) {
-	var conversion conversionResponse
+func (h Handler) stripeWebhook(c *gin.Context) {
+	if h.cfg.StripeWebhookSecret == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "STRIPE_WEBHOOK_SECRET is not configured"})
+		return
+	}
+
+	payload, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "could not read webhook payload"})
+		return
+	}
+
+	event, err := webhook.ConstructEvent(payload, c.GetHeader("Stripe-Signature"), h.cfg.StripeWebhookSecret)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid stripe signature"})
+		return
+	}
+
+	if event.Type == "checkout.session.completed" {
+		var session stripe.CheckoutSession
+		if err := json.Unmarshal(event.Data.Raw, &session); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid checkout session"})
+			return
+		}
+
+		if err := h.recordConversion(&session); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not record conversion"})
+			return
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"received": true})
+}
+
+func (h Handler) createStripeSession(product products.Product, req checkoutRequest) (*stripe.CheckoutSession, error) {
+	successURL := strings.TrimSpace(req.SuccessURL)
+	cancelURL := strings.TrimSpace(req.CancelURL)
+	productPath := "/product/" + strconv.FormatInt(product.ID, 10)
+	if successURL == "" {
+		successURL = strings.TrimRight(h.cfg.FrontendURL, "/") + productPath + "?checkout=success"
+	}
+	if cancelURL == "" {
+		cancelURL = strings.TrimRight(h.cfg.FrontendURL, "/") + productPath + "?checkout=cancelled"
+	}
+
+	stripe.Key = h.cfg.StripeSecretKey
+
+	metadata := map[string]string{
+		"product_id": strconv.FormatInt(product.ID, 10),
+	}
+	if strings.TrimSpace(req.ReferralCode) != "" {
+		metadata["referral_code"] = strings.TrimSpace(req.ReferralCode)
+	}
+
+	productData := &stripe.CheckoutSessionLineItemPriceDataProductDataParams{
+		Name: stripe.String(product.Name),
+	}
+	if strings.TrimSpace(product.Description) != "" {
+		productData.Description = stripe.String(product.Description)
+	}
+
+	return checkoutsession.New(&stripe.CheckoutSessionParams{
+		Mode:       stripe.String(string(stripe.CheckoutSessionModePayment)),
+		SuccessURL: stripe.String(successURL),
+		CancelURL:  stripe.String(cancelURL),
+		Metadata:   metadata,
+		LineItems: []*stripe.CheckoutSessionLineItemParams{
+			{
+				Quantity: stripe.Int64(1),
+				PriceData: &stripe.CheckoutSessionLineItemPriceDataParams{
+					Currency:    stripe.String(strings.ToLower(h.cfg.StripeCurrency)),
+					UnitAmount:  stripe.Int64(product.PriceCents),
+					ProductData: productData,
+				},
+			},
+		},
+	})
+}
+
+func (h Handler) recordConversion(session *stripe.CheckoutSession) error {
+	if session == nil || session.ID == "" {
+		return errors.New("missing stripe checkout session id")
+	}
+
+	productID, err := strconv.ParseInt(session.Metadata["product_id"], 10, 64)
+	if err != nil || productID <= 0 {
+		return errors.New("missing product metadata")
+	}
+
+	product, err := h.findProduct(productID)
+	if err != nil {
+		return err
+	}
 
 	paymentReferenceColumn, err := h.paymentReferenceColumn()
 	if err != nil {
-		return conversion, err
+		return err
+	}
+
+	amountCents := session.AmountTotal
+	if amountCents <= 0 {
+		amountCents = product.PriceCents
 	}
 
 	var affiliateID sql.NullInt64
-	referralCode = strings.TrimSpace(referralCode)
+	referralCode := strings.TrimSpace(session.Metadata["referral_code"])
 	if referralCode != "" {
 		err := h.db.QueryRow(`
 			SELECT id
@@ -98,7 +195,7 @@ func (h Handler) recordTestConversion(product products.Product, referralCode str
 			WHERE referral_code = $1 AND role = 'affiliate'
 		`, referralCode).Scan(&affiliateID)
 		if err != nil && err != sql.ErrNoRows {
-			return conversion, err
+			return err
 		}
 	}
 
@@ -106,12 +203,7 @@ func (h Handler) recordTestConversion(product products.Product, referralCode str
 	var affiliateValue any
 	if affiliateID.Valid {
 		affiliateValue = affiliateID.Int64
-		commissionAmount = int64(math.Round(float64(product.PriceCents) * (product.CommissionPercent / 100)))
-	}
-
-	paymentReference, err := newPaymentReference()
-	if err != nil {
-		return conversion, err
+		commissionAmount = int64(math.Round(float64(amountCents) * (product.CommissionPercent / 100)))
 	}
 
 	query := fmt.Sprintf(`
@@ -124,39 +216,11 @@ func (h Handler) recordTestConversion(product products.Product, referralCode str
 			%s
 		)
 		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id, affiliate_id, seller_id, product_id, amount_cents,
-			commission_amount_cents, %s, created_at
+		ON CONFLICT (%s) DO NOTHING
 	`, paymentReferenceColumn, paymentReferenceColumn)
 
-	var returnedAffiliateID sql.NullInt64
-	err = h.db.QueryRow(
-		query,
-		affiliateValue,
-		product.SellerID,
-		product.ID,
-		product.PriceCents,
-		commissionAmount,
-		paymentReference,
-	).Scan(
-		&conversion.ID,
-		&returnedAffiliateID,
-		&conversion.SellerID,
-		&conversion.ProductID,
-		&conversion.AmountCents,
-		&conversion.CommissionAmountCents,
-		&conversion.PaymentReference,
-		&conversion.CreatedAt,
-	)
-	if err != nil {
-		return conversion, err
-	}
-
-	if returnedAffiliateID.Valid {
-		id := returnedAffiliateID.Int64
-		conversion.AffiliateID = &id
-	}
-
-	return conversion, nil
+	_, err = h.db.Exec(query, affiliateValue, product.SellerID, product.ID, amountCents, commissionAmount, session.ID)
+	return err
 }
 
 func (h Handler) paymentReferenceColumn() (string, error) {
@@ -173,14 +237,6 @@ func (h Handler) paymentReferenceColumn() (string, error) {
 		return "", errors.New("conversions payment reference column is missing")
 	}
 	return column, err
-}
-
-func newPaymentReference() (string, error) {
-	bytes := make([]byte, 12)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", err
-	}
-	return "test_" + hex.EncodeToString(bytes), nil
 }
 
 func (h Handler) findProduct(id int64) (products.Product, error) {

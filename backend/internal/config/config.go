@@ -7,11 +7,14 @@ import (
 )
 
 type Config struct {
-	AppEnv      string
-	HTTPAddr    string
-	DatabaseURL string
-	JWTSecret   string
-	FrontendURL string
+	AppEnv              string
+	HTTPAddr            string
+	DatabaseURL         string
+	JWTSecret           string
+	StripeSecretKey     string
+	StripeWebhookSecret string
+	StripeCurrency      string
+	FrontendURL         string
 }
 
 func Load() Config {
@@ -19,11 +22,14 @@ func Load() Config {
 	loadDotEnv("backend/.env")
 
 	return Config{
-		AppEnv:      env("APP_ENV", "development"),
-		HTTPAddr:    env("HTTP_ADDR", ":8080"),
-		DatabaseURL: env("DATABASE_URL", ""),
-		JWTSecret:   env("JWT_SECRET", ""),
-		FrontendURL: env("FRONTEND_URL", "http://localhost:5173"),
+		AppEnv:              env("APP_ENV", "development"),
+		HTTPAddr:            env("HTTP_ADDR", ":8080"),
+		DatabaseURL:         env("DATABASE_URL", ""),
+		JWTSecret:           env("JWT_SECRET", ""),
+		StripeSecretKey:     env("STRIPE_SECRET_KEY", ""),
+		StripeWebhookSecret: env("STRIPE_WEBHOOK_SECRET", ""),
+		StripeCurrency:      env("STRIPE_CURRENCY", "usd"),
+		FrontendURL:         env("FRONTEND_URL", "http://localhost:5173"),
 	}
 }
 

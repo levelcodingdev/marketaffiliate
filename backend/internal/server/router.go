@@ -36,7 +36,7 @@ func NewRouter(cfg config.Config, database *sql.DB) *gin.Engine {
 	auth.RegisterRoutes(router.Group("/auth"), cfg, database)
 	products.RegisterRoutes(router.Group("/products"), cfg, database)
 	tracking.RegisterRoutes(router.Group("/track"), cfg, database)
-	payments.RegisterRoutes(router.Group("/purchase"), cfg, database)
+	payments.RegisterRoutes(router.Group("/checkout-session"), router.Group("/webhook"), cfg, database)
 	dashboard.RegisterRoutes(router.Group("/dashboard"), cfg, database)
 
 	return router
@@ -54,7 +54,7 @@ func cors(cfg config.Config) gin.HandlerFunc {
 
 		c.Writer.Header().Set("Vary", "Origin")
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Stripe-Signature")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 
 		if c.Request.Method == http.MethodOptions {

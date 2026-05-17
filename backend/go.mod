@@ -5,6 +5,7 @@ go 1.22
 require (
 	github.com/gin-gonic/gin v1.10.0
 	github.com/lib/pq v1.10.9
+	github.com/stripe/stripe-go/v85 v85.0.0
 	golang.org/x/crypto v0.26.0
 )
 
